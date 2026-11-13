@@ -1,7 +1,0 @@
-INFO:     Started server process [4583]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8016 (Press CTRL+C to quit)
-[startup] 恢复上次异常退出：[1, 1]（SAVING 行已转待核实）
-INFO:     127.0.0.1:43842 - "POST /batches/1/start HTTP/1.1" 303 See Other
-INFO:     127.0.0.1:48968 - "GET /api/batches/1 HTTP/1.1" 200 OK

@@ -44,9 +44,10 @@
 </head>
 <body>
 <header>
-  <strong>水质结果报送控制台</strong>
+  <strong>水质结果报送控制台 · 控制台 {{ console_name }}</strong>
   &nbsp;|&nbsp; <a href="/">批次列表</a>
-  <span style="float:right" class="muted">旧站地址由环境变量配置，后台仅经浏览器访问</span>
+  {% if peer_url %}<a href="{{ peer_url }}" target="_blank">另一控制台</a>{% endif %}
+  <span style="float:right" class="muted">两控制台共享数据库与上传目录；旧站仅经浏览器访问</span>
 </header>
 <main>
 {% block body %}{% endblock %}

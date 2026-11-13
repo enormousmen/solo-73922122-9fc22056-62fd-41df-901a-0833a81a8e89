@@ -7,6 +7,8 @@ data/*.log
 data/*.pid
 data/uploads/*
 data/screenshots/*
+data/t-*.csv
+data/t-*/
 !data/uploads/.gitkeep
 !data/screenshots/.gitkeep
 !data/sample-*.csv

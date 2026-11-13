@@ -63,7 +63,7 @@ class ReportingWorker:
 
     def __init__(self, base_url: str, db_path: str, screenshot_dir: str,
                  headless: bool = True, slow_mo_ms: int = 0,
-                 channel: str | None = None):
+                 channel: str | None = None, owner_id: str = ""):
         self.base_url = base_url.rstrip("/")
         self.db_path = db_path
         self.shot_dir = Path(screenshot_dir)
@@ -73,6 +73,8 @@ class ReportingWorker:
         # 默认 None = Playwright 自带 headless shell；
         # 本机缺 shell 时可用 channel="chromium" 走完整 Chromium
         self.channel = channel or None
+        # 所属控制台实例：写入 worker_lock，供跨控制台崩溃恢复判定
+        self.owner_id = owner_id
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._current: dict[str, Any] = {"batch_id": None, "row_seq": None}
@@ -107,7 +109,7 @@ class ReportingWorker:
         pw: Playwright | None = None
         try:
             try:
-                worker_id = db.acquire_lock(conn, batch_id)
+                worker_id = db.acquire_lock(conn, batch_id, self.owner_id)
             except db.LockBusy as exc:
                 db.set_batch_status(conn, batch_id, db.BATCH_STOPPED,
                                     note=f"[{db.now()}] {exc}；")
@@ -128,9 +130,11 @@ class ReportingWorker:
                 browser.close()
         except Exception as exc:  # 浏览器启动失败等：批次安全落地为暂停
             try:
+                recovered = db.recover_batch_saving(conn, batch_id)
+                extra = f"{recovered} 行转待核实；" if recovered else ""
                 db.set_batch_status(
                     conn, batch_id, db.BATCH_STOPPED,
-                    note=f"[{db.now()}] 浏览器任务异常：{exc}；",
+                    note=f"[{db.now()}] 浏览器任务异常：{exc}；{extra}",
                 )
             except Exception:
                 pass

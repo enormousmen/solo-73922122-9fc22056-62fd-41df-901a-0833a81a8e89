@@ -8,14 +8,23 @@
 5. 旧站允许重复键（直接验证旧站行为）
 6. 保存后断连：UNVERIFIED；关闭断连续跑 -> 核实为已 SAVED，不重复入库
 7. 查询中断（保存前断连）：QUERY_FAILED，绝不被当成不存在
-8. 每批单实例：运行中再次启动被拒
-9. 重启恢复：SAVING 残留 -> UNVERIFIED，锁被清理
+8. 每批单实例：运行中再次启动被拒（含跨控制台 409）
+9. 跨控制台崩溃恢复：死控制台的锁被清理，SAVING -> UNVERIFIED
+10. 冲突人工处理后重置待核实，续跑核实
+11. 未发布批次：不可查询、不可报送，原件与草稿被自动清理
+12. 建批进行中：批次不发布、原件不被误清，发布后才可查询
+13. 双控制台同名并发上传：各自原件分别保留，批次行与原件对应
+     （需 REPORTER_B_URL 指向第二个控制台，否则跳过）
+
+运行前置：按 README 起好服务（本机：./run-local.sh 起 A/B 双控制台）。
 """
+import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -24,11 +33,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPORTER = os.environ.get("REPORTER_URL", "http://127.0.0.1:8010")
+REPORTER_B = os.environ.get("REPORTER_B_URL", "http://127.0.0.1:8012")
 LEGACY = os.environ.get("LEGACY_URL", "http://127.0.0.1:8011")
 RDB = Path(os.environ.get("REPORTER_DB", ROOT / "data/reporter.db"))
 LDB = Path(os.environ.get("LEGACY_DB", ROOT / "data/legacy.db"))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", ROOT / "data/uploads"))
 
-PASS, FAIL = 0, 0
+PASS, FAIL, SKIP = 0, 0, 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -39,6 +50,12 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     else:
         FAIL += 1
         print(f"  FAIL  {name}  {detail}")
+
+
+def skip(name: str, why: str) -> None:
+    global SKIP
+    SKIP += 1
+    print(f"  SKIP  {name}  ({why})")
 
 
 def http(method: str, url: str, data: bytes | None = None,
@@ -55,19 +72,33 @@ def http(method: str, url: str, data: bytes | None = None,
         raise
 
 
-def upload_batch(csv_path: Path) -> int:
+def reachable(url: str) -> bool:
+    try:
+        urllib.request.urlopen(url + "/", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def upload_batch(csv_path: Path, base: str = REPORTER,
+                 demo_delay: int = 0) -> int:
     boundary = "----t" + str(time.time_ns())
     content = csv_path.read_bytes()
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{csv_path.name}"\r\n'
-        "Content-Type: text/csv\r\n\r\n"
-    ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    parts = [
+        (f"--{boundary}\r\n"
+         f'Content-Disposition: form-data; name="file"; '
+         f'filename="{csv_path.name}"\r\n'
+         "Content-Type: text/csv\r\n\r\n").encode() + content + b"\r\n",
+        (f"--{boundary}\r\n"
+         'Content-Disposition: form-data; name="demo_delay"\r\n\r\n'
+         f"{demo_delay}\r\n").encode(),
+    ]
+    body = b"".join(parts) + f"--{boundary}--\r\n".encode()
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
-    req = urllib.request.Request(
-        f"{REPORTER}/batches", data=body, method="POST")
-    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    with opener.open(req, timeout=30) as resp:
+    req = urllib.request.Request(f"{base}/batches", data=body, method="POST")
+    req.add_header("Content-Type",
+                   f"multipart/form-data; boundary={boundary}")
+    with opener.open(req, timeout=60) as resp:
         return int(resp.url.rstrip("/").split("/")[-1])
 
 
@@ -75,7 +106,8 @@ def upload_expect_error(csv_path: Path) -> tuple[int, bytes]:
     boundary = "----t" + str(time.time_ns())
     body = (
         f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{csv_path.name}"\r\n'
+        f'Content-Disposition: form-data; name="file"; '
+        f'filename="{csv_path.name}"\r\n'
         "Content-Type: text/csv\r\n\r\n"
     ).encode() + csv_path.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
     return http("POST", f"{REPORTER}/batches", body,
@@ -83,18 +115,19 @@ def upload_expect_error(csv_path: Path) -> tuple[int, bytes]:
                 allow_errors=True)
 
 
-def post_form(path: str, fields: dict[str, str]):
+def post_form(path: str, fields: dict[str, str], base: str = REPORTER):
     data = urllib.parse.urlencode(fields).encode()
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
-    req = urllib.request.Request(REPORTER + path, data=data, method="POST")
+    req = urllib.request.Request(base + path, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     with opener.open(req, timeout=30) as resp:
         return resp.status, resp.url
 
 
-def post_form_expect_error(path: str, fields: dict[str, str]):
+def post_form_expect_error(path: str, fields: dict[str, str],
+                           base: str = REPORTER):
     data = urllib.parse.urlencode(fields).encode()
-    req = urllib.request.Request(REPORTER + path, data=data, method="POST")
+    req = urllib.request.Request(base + path, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     try:
         urllib.request.urlopen(req, timeout=30)
@@ -111,10 +144,11 @@ def set_disconnect(mode: str) -> None:
     urllib.request.urlopen(req, timeout=15).read()
 
 
-def wait_batch(batch_id: int, timeout: float = 90.0) -> dict:
+def wait_batch(batch_id: int, timeout: float = 90.0,
+               base: str = REPORTER) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        status, body = http("GET", f"{REPORTER}/api/batches/{batch_id}")
+        status, body = http("GET", f"{base}/api/batches/{batch_id}")
         data = json.loads(body)
         if not data["busy"]:
             return data
@@ -123,8 +157,6 @@ def wait_batch(batch_id: int, timeout: float = 90.0) -> dict:
 
 
 def legacy_count(sample_no: str, project: str) -> int:
-    q = urllib.parse.urlencode({"sample_no": sample_no, "project": project})
-    # 只用浏览器页面路径不方便计数；这里通过旧站 records.json（演示核对接口）
     _, body = http("GET", f"{LEGACY}/records.json")
     rows = json.loads(body)
     return sum(1 for r in rows
@@ -173,6 +205,9 @@ def main() -> int:
     check("旧站恰好 5 条相关记录",
           legacy_count("W2026-001", "pH") == 1
           and legacy_count("W2026-003", "COD") == 1)
+    check("批次记录原件摘要",
+          len(d["batch"]["sha256"]) == 64 and d["batch"]["stored_name"],
+          str(d["batch"].get("stored_name")))
 
     print("== 3. 同值重报 -> ALREADY_SENT，不重复入库 ==")
     b2 = upload_batch(ROOT / "data/sample-batch-a.csv")
@@ -188,6 +223,8 @@ def main() -> int:
     check("旧站无重复行",
           legacy_count("W2026-001", "pH") == 1
           and legacy_count("W2026-002", "氨氮") == 1)
+    check("同名再建批原件各自保留",
+          d["batch"]["stored_name"] != wait_batch(b1)["batch"]["stored_name"])
 
     print("== 4. 异值 -> CONFLICT 停批，含双方值 ==")
     conflict_csv = write_csv(
@@ -206,7 +243,6 @@ def main() -> int:
     check("旧站未被写入异值", legacy_results("W2026-001", "pH") == ["7.2"])
 
     print("== 5. 旧站本身允许重复键 ==")
-    # 直接走旧站网页保存两次同键
     for val in ("5.55", "5.55"):
         data = urllib.parse.urlencode({
             "sample_no": "DUP-KEY", "project": "pH", "result": val}).encode()
@@ -268,7 +304,7 @@ def main() -> int:
           all(r["status"] == "SAVED" for r in d["rows"]),
           str([r["status"] for r in d["rows"]]))
 
-    print("== 8. 每批单实例锁 ==")
+    print("== 8. 每批单实例锁（含跨控制台） ==")
     b6 = upload_batch(write_csv(
         "t-lock.csv",
         "样本号,项目,结果\n"
@@ -279,36 +315,48 @@ def main() -> int:
     code, body = post_form_expect_error(f"/batches/{b6}/start",
                                         {"resume": "1"})
     check("运行中再次启动被拒(409)", code == 409, str(code))
+    if reachable(REPORTER_B):
+        code, body = post_form_expect_error(f"/batches/{b6}/start",
+                                            {"resume": "1"}, base=REPORTER_B)
+        check("另一控制台同样被拒(409)", code == 409, str(code))
+    else:
+        skip("另一控制台同样被拒(409)", "REPORTER_B_URL 不可达")
     wait_batch(b6)
 
-    print("== 9. 重启恢复：SAVING 残留 -> UNVERIFIED，锁清理 ==")
+    print("== 9. 跨控制台崩溃恢复：死控制台锁被清理，SAVING->UNVERIFIED ==")
     conn = sqlite3.connect(RDB)
-    conn.execute("INSERT INTO worker_lock(id,worker_id,batch_id,acquired_at)"
-                 " VALUES(1,'dead-worker',?,'2026-01-01T00:00:00')", (b6,))
-    conn.execute("UPDATE rows SET status='SAVING' WHERE batch_id=? "
-                 "AND seq=1", (b6,))
+    conn.execute(
+        "INSERT INTO consoles(id, name, started_at, heartbeat_at) "
+        "VALUES('ghost-console', '幽灵', '2020-01-01T00:00:00', "
+        "'2020-01-01T00:00:00')")
+    conn.execute(
+        "INSERT INTO worker_lock(id, worker_id, batch_id, owner_id, "
+        "acquired_at) VALUES(1, 'dead-worker', ?, 'ghost-console', "
+        "'2020-01-01T00:00:00')", (b6,))
+    conn.execute("UPDATE rows SET status='SAVING' WHERE batch_id=? AND seq=1",
+                 (b6,))
     conn.commit()
     conn.close()
-    # 在独立进程里执行启动恢复逻辑
-    env = dict(os.environ)
-    env.update({
-        "REPORTER_DB": str(RDB),
-        "UPLOAD_DIR": str(ROOT / "data/uploads"),
-        "SCREENSHOT_DIR": str(ROOT / "data/screenshots"),
-    })
-    out = subprocess.run(
-        [sys.executable, "-c",
-         "from reporter import db; c=db.connect('" + str(RDB) + "');"
-         "print(db.recover_stale_runs(c)); c.close()"],
-        cwd=str(ROOT), env=env, capture_output=True, text=True)
-    check("恢复执行无异常", out.returncode == 0, out.stderr)
-    conn = sqlite3.connect(RDB)
-    lock = conn.execute("SELECT COUNT(*) FROM worker_lock").fetchone()[0]
-    st = conn.execute(
-        "SELECT status FROM rows WHERE batch_id=? AND seq=1", (b6,)).fetchone()[0]
-    conn.close()
-    check("残留锁被清理", lock == 0, str(lock))
+    # 控制台应用的后台清理（janitor）应在数秒内自动完成恢复
+    deadline = time.time() + 40
+    lock_left, st = 1, "SAVING"
+    while time.time() < deadline:
+        conn = sqlite3.connect(RDB)
+        lock_left = conn.execute(
+            "SELECT COUNT(*) FROM worker_lock").fetchone()[0]
+        st = conn.execute(
+            "SELECT status FROM rows WHERE batch_id=? AND seq=1",
+            (b6,)).fetchone()[0]
+        ghost_left = conn.execute(
+            "SELECT COUNT(*) FROM consoles WHERE id='ghost-console'"
+        ).fetchone()[0]
+        conn.close()
+        if lock_left == 0 and st == "UNVERIFIED" and ghost_left == 0:
+            break
+        time.sleep(1)
+    check("残留锁被自动清理", lock_left == 0, str(lock_left))
     check("SAVING 恢复为 UNVERIFIED", st == "UNVERIFIED", st)
+    check("死控制台登记被回收", ghost_left == 0, str(ghost_left))
 
     print("== 10. 冲突人工处理后重置待核实，续跑核实 ==")
     b7_csv = write_csv("t-recheck.csv",
@@ -316,34 +364,27 @@ def main() -> int:
     b7 = upload_batch(b7_csv)
     post_form(f"/batches/{b7}/start", {"resume": "0"})
     d = wait_batch(b7)
-    rid = d["rows"][0]["id"]
     check("首次报送 SAVED", d["rows"][0]["status"] == "SAVED",
           d["rows"][0]["status"])
-    # 同键异值 -> 冲突停批
     b8 = upload_batch(write_csv(
         "t-recheck2.csv", "样本号,项目,结果\nW2026-501,pH,3.33\n"))
     post_form(f"/batches/{b8}/start", {"resume": "0"})
     d = wait_batch(b8)
     check("异值行 CONFLICT", d["rows"][0]["status"] == "CONFLICT",
           d["rows"][0]["status"])
-    # 非冲突行不能重置
     b8_row = d["rows"][0]["id"]
     code, _ = post_form_expect_error(
         f"/batches/{b8}/rows/{b8_row + 999}/recheck", {})
     check("不存在行重置被拒(404)", code == 404, str(code))
-    # 模拟人工在旧站按本地正确值补录一条（旧站允许同键多行）
     data = urllib.parse.urlencode(
         {"sample_no": "W2026-501", "project": "pH", "result": "3.33"}).encode()
     req = urllib.request.Request(f"{LEGACY}/save", data=data, method="POST")
     urllib.request.urlopen(req, timeout=15).read()
-    # 重置冲突行为待核实
-    status, _ = post_form(
-        f"/batches/{b8}/rows/{b8_row}/recheck", {})
+    status, _ = post_form(f"/batches/{b8}/rows/{b8_row}/recheck", {})
     check("重置请求成功", status == 200)
     d = json.loads(http("GET", f"{REPORTER}/api/batches/{b8}")[1])
     check("行已转 UNVERIFIED", d["rows"][0]["status"] == "UNVERIFIED",
           d["rows"][0]["status"])
-    # 续跑：查询命中同值记录 -> SAVED，且不新增
     post_form(f"/batches/{b8}/start", {"resume": "1"})
     d = wait_batch(b8)
     check("续跑核实后 SAVED", d["rows"][0]["status"] == "SAVED",
@@ -353,7 +394,143 @@ def main() -> int:
     check("远端共 2 条同键记录（旧值+人工补录），后台未再新增",
           legacy_count("W2026-501", "pH") == 2)
 
-    print(f"\n==== RESULT: {PASS} passed, {FAIL} failed ====")
+    print("== 11. 未发布批次：不可见、不可报送、被清理 ==")
+    # 直接往共享库塞一个"死控制台留下的草稿批"，模拟建批中途退出的残骸
+    ghost_file = "t-ghost-draft-deadbeef.csv"
+    (UPLOAD_DIR / ghost_file).write_text(
+        "样本号,项目,结果\nG-1,pH,1\n", encoding="utf-8")
+    (UPLOAD_DIR / "incoming").mkdir(exist_ok=True)
+    (UPLOAD_DIR / "incoming" / f"{ghost_file}.part").write_text(
+        "半截文件", encoding="utf-8")
+    conn = sqlite3.connect(RDB)
+    cur = conn.execute(
+        "INSERT INTO batches(filename, stored_name, sha256, row_count, "
+        "owner_id, created_by, status, created_at, updated_at) "
+        "VALUES('t-ghost-draft.csv', ?, 'deadbeef', 1, 'ghost-console-2', "
+        "'幽灵', 'CREATING', '2020-01-01T00:00:00', '2020-01-01T00:00:00')",
+        (ghost_file,))
+    ghost_bid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO rows(batch_id, seq, sample_no, project, result, status, "
+        "updated_at) VALUES(?, 1, 'G-1', 'pH', '1', 'PENDING', "
+        "'2020-01-01T00:00:00')", (ghost_bid,))
+    conn.commit()
+    conn.close()
+    code, _ = http("GET", f"{REPORTER}/api/batches/{ghost_bid}",
+                   allow_errors=True)
+    check("草稿批 API 查询不到(404)", code == 404, str(code))
+    code, _ = post_form_expect_error(f"/batches/{ghost_bid}/start",
+                                     {"resume": "0"})
+    check("草稿批不能报送(404)", code == 404, str(code))
+    _, page = http("GET", f"{REPORTER}/")
+    check("草稿批不出现在批次列表", b"t-ghost-draft" not in page)
+    # 等 janitor 回收（死控制台 => 草稿行删除、原件与 .part 删除）
+    deadline = time.time() + 40
+    gone_db = gone_file = False
+    while time.time() < deadline:
+        conn = sqlite3.connect(RDB)
+        gone_db = conn.execute(
+            "SELECT COUNT(*) FROM batches WHERE id=?",
+            (ghost_bid,)).fetchone()[0] == 0
+        rows_left = conn.execute(
+            "SELECT COUNT(*) FROM rows WHERE batch_id=?",
+            (ghost_bid,)).fetchone()[0]
+        conn.close()
+        gone_file = (not (UPLOAD_DIR / ghost_file).exists()
+                     and not (UPLOAD_DIR / "incoming"
+                              / f"{ghost_file}.part").exists())
+        if gone_db and rows_left == 0 and gone_file:
+            break
+        time.sleep(1)
+    check("草稿批行被清理", gone_db)
+    check("草稿批数据行被清理", rows_left == 0, str(rows_left))
+    check("未发布原件与 .part 被清理", gone_file)
+
+    print("== 12. 建批进行中：不发布、不误清，发布后可见 ==")
+    stem = f"t-slow-{int(time.time())}"
+    slow_csv = write_csv(
+        f"{stem}.csv",
+        "样本号,项目,结果\nSLOW-1,pH,5.5\nSLOW-2,pH,6.6\n")
+    before = set(UPLOAD_DIR.glob(f"{stem}-*.csv"))
+    result: dict = {}
+
+    def do_upload():
+        result["bid"] = upload_batch(slow_csv, demo_delay=6)
+
+    t = threading.Thread(target=do_upload)
+    t.start()
+    time.sleep(2.5)  # 建批进行中（demo_delay=6s）
+    _, page = http("GET", f"{REPORTER}/")
+    check("建批进行中批次不发布", stem.encode() not in page)
+    mid = set(UPLOAD_DIR.glob(f"{stem}-*.csv")) - before
+    check("建批进行中原件已落盘且未被误清", len(mid) == 1,
+          str([p.name for p in mid]))
+    t.join(timeout=30)
+    bid_slow = result.get("bid")
+    check("慢建批最终成功发布", bid_slow is not None)
+    if bid_slow is not None:
+        d = json.loads(http("GET", f"{REPORTER}/api/batches/{bid_slow}")[1])
+        check("发布后行数完整", len(d["rows"]) == 2, str(len(d["rows"])))
+        check("发布后原件可下载",
+              http("GET", f"{REPORTER}/batches/{bid_slow}/original",
+                   allow_errors=True)[0] == 200)
+
+    print("== 13. 双控制台同名并发上传 ==")
+    if not reachable(REPORTER_B):
+        skip("同名并发上传双控制台验证", "REPORTER_B_URL 不可达")
+    else:
+        dir_a = ROOT / "data" / "t-same-a"
+        dir_b = ROOT / "data" / "t-same-b"
+        dir_a.mkdir(exist_ok=True)
+        dir_b.mkdir(exist_ok=True)
+        csv_a = dir_a / "t-samename.csv"
+        csv_b = dir_b / "t-samename.csv"
+        csv_a.write_text("样本号,项目,结果\nSAME-A,pH,7.1\n", encoding="utf-8")
+        csv_b.write_text(
+            "样本号,项目,结果\nSAME-B,pH,8.8\nSAME-B,浊度,4.4\n",
+            encoding="utf-8")
+        ids: dict = {}
+
+        def up(key, base, path):
+            ids[key] = upload_batch(path, base=base, demo_delay=2)
+
+        ta = threading.Thread(target=up, args=("a", REPORTER, csv_a))
+        tb = threading.Thread(target=up, args=("b", REPORTER_B, csv_b))
+        ta.start(); tb.start()
+        ta.join(timeout=40); tb.join(timeout=40)
+        ba, bb = ids.get("a"), ids.get("b")
+        check("两控制台同名上传都成功", ba is not None and bb is not None,
+              f"A={ba} B={bb}")
+        if ba and bb:
+            check("生成两个不同批次", ba != bb)
+            da = json.loads(http("GET", f"{REPORTER}/api/batches/{ba}")[1])
+            db_ = json.loads(http("GET", f"{REPORTER_B}/api/batches/{bb}")[1])
+            sa, sb = da["batch"]["stored_name"], db_["batch"]["stored_name"]
+            check("同名文件原件分别保留（不同存储名）", sa != sb, f"{sa} vs {sb}")
+            check("两批原件都在共享目录",
+                  (UPLOAD_DIR / sa).exists() and (UPLOAD_DIR / sb).exists())
+            _, orig_a = http("GET", f"{REPORTER}/batches/{ba}/original")
+            _, orig_b = http("GET", f"{REPORTER_B}/batches/{bb}/original")
+            check("A 批原件内容未被覆盖",
+                  hashlib.sha256(orig_a).hexdigest()
+                  == hashlib.sha256(csv_a.read_bytes()).hexdigest())
+            check("B 批原件内容未被覆盖",
+                  hashlib.sha256(orig_b).hexdigest()
+                  == hashlib.sha256(csv_b.read_bytes()).hexdigest())
+            check("批次行与原件对应（A 1 行 / B 2 行）",
+                  len(da["rows"]) == 1 and len(db_["rows"]) == 2,
+                  f"{len(da['rows'])}/{len(db_['rows'])}")
+            check("行内容来自各自原件",
+                  da["rows"][0]["sample_no"] == "SAME-A"
+                  and db_["rows"][0]["sample_no"] == "SAME-B")
+            check("库中摘要与原件一致",
+                  da["batch"]["sha256"]
+                  == hashlib.sha256(orig_a).hexdigest()
+                  and db_["batch"]["sha256"]
+                  == hashlib.sha256(orig_b).hexdigest())
+
+    print(f"\n==== RESULT: {PASS} passed, {FAIL} failed, "
+          f"{SKIP} skipped ====")
     return 1 if FAIL else 0
 
 

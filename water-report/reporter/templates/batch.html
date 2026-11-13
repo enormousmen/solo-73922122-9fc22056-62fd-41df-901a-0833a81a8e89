@@ -4,6 +4,12 @@
 <h2>批次 #{{ b.id }} — {{ b.filename }}
   <span id="batch-status" class="pill batch-{{ b.status }}">{{ b.status }}</span>
 </h2>
+<p class="muted">
+  建批控制台 {{ b.created_by or '—' }} ·
+  原件 <code>{{ b.stored_name }}</code>
+  {% if b.sha256 %}（SHA-256 <code>{{ b.sha256[:16] }}…</code>）{% endif %}
+  · <a href="/batches/{{ b.id }}/original">下载原件</a>
+</p>
 <p class="muted">{{ b.note }}</p>
 
 <div class="counts" id="counts">
@@ -13,16 +19,21 @@
   {% endfor %}
 </div>
 
+{% if lock and not busy %}
+<div class="flash info" id="lock-note">报送任务正运行在控制台 {{ lock.owner_name }}
+  （批次 #{{ lock.batch_id }}），本控制台只读展示；如需停止请到该控制台操作。</div>
+{% endif %}
+
 <div style="margin:16px 0" id="controls">
   <form method="post" action="/batches/{{ b.id }}/start" style="display:inline">
     <input type="hidden" name="resume" value="0">
     <button type="submit" id="btn-start"
-      {% if busy or b.status == 'DONE' %}disabled{% endif %}>开始报送</button>
+      {% if busy or lock or b.status == 'DONE' %}disabled{% endif %}>开始报送</button>
   </form>
   <form method="post" action="/batches/{{ b.id }}/start" style="display:inline">
     <input type="hidden" name="resume" value="1">
     <button type="submit" class="gray" id="btn-resume"
-      {% if busy %}disabled{% endif %}>续跑（先核实待核实行）</button>
+      {% if busy or lock %}disabled{% endif %}>续跑（先核实待核实行）</button>
   </form>
   <form method="post" action="/batches/{{ b.id }}/stop" style="display:inline">
     <button type="submit" class="red" id="btn-stop" {% if not busy %}disabled{% endif %}>
@@ -55,7 +66,7 @@
               action="/batches/{{ b.id }}/rows/{{ r.id }}/recheck"
               style="margin-top:6px">
           <button type="submit" class="gray" style="padding:4px 10px;font-size:12px"
-            {% if busy %}disabled{% endif %}>人工处理完，重置待核实</button>
+            {% if busy or lock %}disabled{% endif %}>人工处理完，重置待核实</button>
         </form>
         {% endif %}
     </td>
@@ -88,9 +99,10 @@ async function refresh() {
     el.querySelector('.n').textContent = counts[el.dataset.st] || 0;
   });
   const busy = data.busy;
+  const locked = !!data.lock;
   document.getElementById('btn-start').disabled =
-    busy || data.batch.status === 'DONE';
-  document.getElementById('btn-resume').disabled = busy;
+    busy || locked || data.batch.status === 'DONE';
+  document.getElementById('btn-resume').disabled = busy || locked;
   document.getElementById('btn-stop').disabled = !busy;
 
   data.rows.forEach(r => {

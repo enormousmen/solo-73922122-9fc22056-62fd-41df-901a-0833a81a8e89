@@ -1,2 +1,0 @@
-legacy station pid=2001 -> http://127.0.0.1:8011
-reporter console pid=2002 -> http://127.0.0.1:8010

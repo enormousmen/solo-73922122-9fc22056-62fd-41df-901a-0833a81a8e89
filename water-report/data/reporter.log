@@ -1,8 +1,0 @@
-INFO:     Started server process [8163]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8021 (Press CTRL+C to quit)
-INFO:     127.0.0.1:58760 - "GET / HTTP/1.1" 200 OK
-INFO:     127.0.0.1:58770 - "POST /batches HTTP/1.1" 303 See Other
-INFO:     127.0.0.1:58780 - "POST /batches/1/start HTTP/1.1" 303 See Other
-INFO:     127.0.0.1:54526 - "GET /api/batches/1 HTTP/1.1" 200 OK

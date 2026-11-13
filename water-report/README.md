@@ -3,7 +3,43 @@
 把核准的水样检测结果，通过**真实浏览器**录入只有网页表单的旧报送站，并保证
 **断网/重试/进程重启都不会造成重复入库或漏报**。
 
-## 一、为什么不会重复入库（核心语义）
+本版修复建批过程：**两个控制台共享同一 SQLite 与上传目录**，批次只有在
+**原 CSV 及全部行完整保存后**才可查询和开始报送；进程中途退出留下的
+未发布半成品会被安全清理，同名文件并发上传各自保留原件。
+
+## 一、建批可靠性（本次修复）
+
+### 草稿 → 发布两阶段建批
+
+上传建批按以下顺序执行，**任何一步失败或进程退出都不会留下可报送的半批**：
+
+1. 三列 CSV 校验（不通过则整批不建，见第五节）；
+2. 登记 `CREATING` 草稿批（短事务）——批次此刻起**不可查询、不可报送**，
+   但清理逻辑据此知道这份原件归哪个控制台；
+3. 原件落盘：`incoming/*.part`（`O_EXCL` 防覆盖）→ fsync → **原子硬链接**
+   就位（`os.link`：目标已存在则报错，绝不覆盖别人的原件）；
+4. 全部行**一次短事务**入库；
+5. 发布前校验（原件 SHA-256 + 行数），通过才把批次转为可查询/可报送。
+
+### 死控制台清理（重启清理 + 后台巡检）
+
+- 每个控制台进程每 2 秒心跳一次；心跳停摆超过 `CONSOLE_TTL_SECONDS`
+  （默认 15s）即视为已退出；
+- 控制台**启动时**与**后台巡检**都会回收死控制台的未发布草稿批与其原件
+  （含 `.part` 残片）；另一控制台仍在上传的文件**心跳新鲜，绝不被清理**；
+- 文件写入/清理都发生在**不持任何数据库事务**的空档，数据库写入全是
+  短事务（WAL），已有批次在上传/清理期间照常可查询、可报送；
+- 报送任务锁（`worker_lock`）带属主：只有属主控制台死掉，锁才会被清理，
+  并把残留的 `SAVING` 行转 `UNVERIFIED`、`RUNNING` 批转暂停——
+  不会误伤另一控制台正在运行的报送。
+
+### 同名并发上传
+
+每次上传生成带随机令牌的唯一存储名（`原名-<令牌>.csv`），配合 `O_EXCL`
+与原子链接，两个入口同时上传同名文件也**各自保留原件**；批次记录原件的
+存储名与 SHA-256，批次行与原件始终对应（批次详情页可下载原件核对）。
+
+## 二、报送语义（保持不变）
 
 后台对每一行 `(样本号, 项目)` 业务键严格执行"先查后填"，所有旧站操作都由
 Chromium 真实页面完成（查询页 `/search`、录入页 `/new`、保存 `/save`），
@@ -29,32 +65,31 @@ Chromium 真实页面完成（查询页 `/search`、录入页 `/new`、保存 `/
    - 远端已有同值 → 补记远端编号，置 `SAVED`；
    - 远端有异值 → `CONFLICT` 停批；
    - 确认远端确实没有 → 才允许重新填写。
-   进程启动时的 `recover_stale_runs()` 会把残留的 `SAVING` 一律转为
-   `UNVERIFIED`，并清理残留运行锁。
 
-### 每批只运行一份
+### 全局只跑一份报送任务
 
-- 进程内 `WorkerManager` 单 worker + SQLite `worker_lock` 单行表双保险；
-- 运行中再次启动返回 HTTP 409；停止请求只在行边界生效，不打断页面事务。
+- 进程内 `WorkerManager` 单 worker + 共享库 `worker_lock` 单行表双保险，
+  **两个控制台合计**同一时刻只跑一份浏览器任务；
+- 运行中再次启动（任一控制台）返回 HTTP 409；停止请求只在行边界生效；
+- 属主控制台崩溃后，锁由另一控制台在数秒内自动清理并恢复现场。
 
-## 二、目录结构
+## 三、目录结构
 
 ```
 legacy/                模拟"只有网页表单"的旧报送站（独立 FastAPI + SQLite）
-  app.py               仅页面路由；允许重复键；两档断连开关
-  templates/           查询/录入/保存/错误页
-reporter/              报送控制台
-  app.py               Web：上传建批、开始/停止/续跑、逐行状态、事件日志
+reporter/              报送控制台（两个实例共用一份代码）
+  app.py               Web：两阶段建批、开始/停止/续跑、逐行状态、原件下载
   browser_worker.py    Playwright 后台：查询→判定→填表→回执判定→续跑核实
-  db.py                本地 SQLite：批次/行/事件/单实例锁/崩溃恢复
+  db.py                共享 SQLite：草稿/发布、心跳、死控制台清理、单实例锁
+  uploads.py           原件落盘：唯一名、O_EXCL、fsync、原子链接、幂等清理
   csvkit.py            三列 CSV 校验（非负十进制、业务键唯一）
-  templates/           控制台页面（2 秒轮询，无需手动刷新）
+demo/                  可控演示：建批中途退出、同名并发上传
 data/                  示例 CSV 与本机运行数据（*.db 已 gitignore）
-tests/                 单元测试 + 38 项端到端实测
-docker-compose.yml     一键起旧站 + 控制台，数据落命名卷
+tests/                 单元测试 + 端到端实测
+docker-compose.yml     一键起旧站 + 两个共库控制台
 ```
 
-## 三、用 Docker Compose 启动（推荐演示方式）
+## 四、用 Docker Compose 启动（推荐演示方式）
 
 ```bash
 docker compose up --build
@@ -62,24 +97,35 @@ docker compose up --build
 
 | 服务 | 地址 | 说明 |
 |---|---|---|
-| 报送控制台 | http://localhost:8000 | 上传 CSV、报送、续跑 |
+| 报送控制台 A | http://localhost:8000 | 上传 CSV、报送、续跑 |
+| 报送控制台 B | http://localhost:8002 | 与 A **共享同一 SQLite 与上传目录** |
 | 旧报送站 | http://localhost:8001 | 页面操作 + 断连开关 + 记录核对 |
 
-数据持久化：`legacy-data`（旧站 SQLite）、`reporter-data`（本地进度、上传文件、
-截图）。`docker compose down` 后数据仍在；`down -v` 才会清空。
+数据持久化：`legacy-data`（旧站 SQLite）、`reporter-data`（两控制台共享：
+本地进度、上传原件、截图）。`docker compose down` 后数据仍在；
+`down -v` 才会清空。
 
-旧站首页有三个演练按钮：
+旧站首页有三个演练按钮：**开启：仅保存后断连**（`/save` 先落库再返回 500）、
+**开启：全站断连**（连查询也失败）、**全部恢复正常**。
 
-- **开启：仅保存后断连** —— `/save` 先落库再返回 500，模拟"保存成功但回执丢失"；
-- **开启：全站断连** —— 连查询也失败，用于验证"查询失败不能当成不存在"；
-- **全部恢复正常**。
+### 建批事故演示（可控脚本）
 
-## 四、浏览器演示剧本（约 5 分钟）
+```bash
+./demo/mid-create-exit.sh        # 建批中途 kill 控制台：半批不可见、重启清理
+./demo/concurrent-same-name.sh   # 两控制台同名并发上传：各自原件分别保留
+```
 
-1. 打开 http://localhost:8000，上传 `data/sample-batch-a.csv`，点**开始报送**：
-   逐行变为 `SAVED`，每行显示远端记录编号，批次 `DONE`。
-2. 用同一文件再建一批并开始：全部 `ALREADY_SENT`，旧站记录数不增加。
-3. 打开旧站 http://localhost:8001，点**开启：仅保存后断连**；
+细节见 `demo/README.md`。上传表单里也带了"演示：建批延时 N 秒"输入框，
+可手工拉长"未发布"窗口再配合 `docker compose kill` 演练。
+
+## 五、浏览器演示剧本（约 5 分钟）
+
+1. 打开控制台 A（http://localhost:8000），上传 `data/sample-batch-a.csv`，
+   点**开始报送**：逐行变为 `SAVED`，每行显示远端记录编号，批次 `DONE`。
+2. 打开控制台 B（http://localhost:8002）：能看到同一批（共享库）；
+   用同一文件再建一批并开始：全部 `ALREADY_SENT`，旧站记录数不增加，
+   且两批原件各自保留（批次详情页可下载核对）。
+3. 打开旧站（http://localhost:8001）点**开启：仅保存后断连**；
    上传 `data/sample-batch-b.csv` 并开始：两行均为 `UNVERIFIED`
    （旧站记录其实已写入，可在旧站"全部记录"核对）。
 4. 旧站点**全部恢复正常**，回到控制台点**续跑（先核实待核实行）**：
@@ -89,8 +135,12 @@ docker compose up --build
 6. 异值停批：对旧站已存在的键上传不同结果的 CSV，首行 `CONFLICT`，
    说明里同时给出本地值与远端编号/值，批次停止、后续行不处理。
    人工在旧站更正后，可在该行点**重置待核实**，再续跑（仍先查询核实，不盲填）。
+7. 建批事故演练：上传时填"建批延时 60 秒"，提交后
+   `docker compose kill reporter-a`，再到控制台 B 确认半批不可见；
+   `docker compose up -d reporter-a` 后原件与草稿被清理（或直接用
+   第四节的两个演示脚本）。
 
-## 五、CSV 格式
+## 六、CSV 格式
 
 表头三列（支持中英文表头与 UTF-8/GB18030 编码）：
 
@@ -103,7 +153,7 @@ W2026-001,浊度,3.50
 - 结果必须是非负有限十进制数（`0`、`7.2`、`0.00` 均可，负数/`abc`/`Infinity` 拒绝）；
 - `(样本号, 项目)` 在文件内不得重复；空行自动跳过；校验失败整批不建。
 
-## 六、本机直接运行（无 Docker 时）
+## 七、本机直接运行（无 Docker 时）
 
 需要 Python 3.11+、Playwright Chromium：
 
@@ -111,31 +161,39 @@ W2026-001,浊度,3.50
 python3 -m venv --without-pip .venv          # 按本机环境引导 pip
 .venv/bin/pip install -r reporter/requirements.txt
 .venv/bin/python -m playwright install chromium
-./run-local.sh                               # 旧站 :8011，控制台 :8010
+./run-local.sh                               # 旧站 :8011，控制台 A :8010，控制台 B :8012
 ```
 
-可用环境变量：`LEGACY_PORT`、`REPORTER_PORT`、`HEADLESS=0`（有显示器时看真实填表）、
-`SLOW_MO_MS`、`BROWSER_CHANNEL=chromium`、`LEGACY_URL`、`REPORTER_DB`、`LEGACY_DB`。
+可用环境变量：`LEGACY_PORT`、`REPORTER_A_PORT`、`REPORTER_B_PORT`、
+`HEADLESS=0`（有显示器时看真实填表）、`SLOW_MO_MS`、
+`BROWSER_CHANNEL=chromium`、`LEGACY_URL`、`REPORTER_DB`、`LEGACY_DB`。
 
-## 七、测试
+## 八、测试
 
 ```bash
-.venv/bin/python -m pytest tests/unit_test.py -q          # 纯单元测试（14 项）
-# 端到端（需先按第六节起好两个服务，驱动真实 Chromium）：
-REPORTER_URL=http://127.0.0.1:8010 LEGACY_URL=http://127.0.0.1:8011 \
-  .venv/bin/python -I tests/e2e_test.py                    # 30 项断言
+.venv/bin/python -m pytest tests/unit_test.py -q          # 纯单元测试
+# 端到端（需先按第七节起好服务，驱动真实 Chromium）：
+REPORTER_URL=http://127.0.0.1:8010 REPORTER_B_URL=http://127.0.0.1:8012 \
+LEGACY_URL=http://127.0.0.1:8011 \
+  .venv/bin/python -I tests/e2e_test.py
 ```
 
 端到端覆盖：CSV 校验、先查后填、同值不重复、异值停批双方值、旧站允许重复键、
-保存后断连→待核实→续跑无重复、查询失败不入库、单实例 409、重启恢复 SAVING→待核实、
-冲突人工更正后重置再核实（共 38 项断言）。
+保存后断连→待核实→续跑无重复、查询失败不入库、单实例 409（含跨控制台）、
+死控制台锁恢复、未发布批次不可见不可报送并被清理、建批进行中不发布不误清、
+双控制台同名并发上传各自保留原件。
 
-## 八、关键环境变量
+## 九、关键环境变量
 
 | 变量 | 默认值 | 含义 |
 |---|---|---|
+| `CONSOLE_NAME` | `A` | 控制台名称（部署中唯一，页面展示） |
+| `CONSOLE_ID` | 启动时随机 | 控制台实例 id（心跳/锁/草稿属主） |
+| `CONSOLE_TTL_SECONDS` | `15` | 心跳停摆多久判定控制台已退出 |
+| `JANITOR_INTERVAL_SECONDS` | `2` | 心跳与死控制台清理的间隔 |
 | `LEGACY_URL` | `http://legacy:8000` | 旧站基址，后台只经浏览器访问 |
 | `HEADLESS` | `1` | 设 `0` 可观察真实浏览器操作 |
 | `SLOW_MO_MS` | `0`（compose 内 150） | 浏览器动作放慢，便于演示 |
 | `BROWSER_CHANNEL` | 空 | 本机缺 headless-shell 时设 `chromium` |
-| `REPORTER_DB` / `UPLOAD_DIR` / `SCREENSHOT_DIR` | `/data/...` | 本地持久化路径 |
+| `REPORTER_DB` / `UPLOAD_DIR` / `SCREENSHOT_DIR` | `/data/...` | 本地持久化路径（两控制台相同） |
+| `PEER_CONSOLE_URL` | 空 | 页头"另一控制台"链接 |

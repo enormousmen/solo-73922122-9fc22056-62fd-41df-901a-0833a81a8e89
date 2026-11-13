@@ -2,28 +2,39 @@
 {% block body %}
 <h2>上传 CSV 新建报送批次</h2>
 <p class="muted">CSV 必须包含三列表头：<code>样本号</code>、<code>项目</code>、<code>结果</code>；
-结果为非负十进制数；（样本号, 项目）为业务键，文件内不得重复。</p>
+结果为非负十进制数；（样本号, 项目）为业务键，文件内不得重复。<br>
+原件与全部行完整保存后批次才会发布（可查询、可报送）；同名文件并发上传各自保留原件。</p>
 <form method="post" action="/batches" enctype="multipart/form-data">
   <input type="file" name="file" accept=".csv" required>
   <button type="submit">上传并建批</button>
+  <span class="muted" style="margin-left:14px">演示：建批延时
+    <input type="number" name="demo_delay" value="0" min="0"
+           max="{{ max_demo_delay }}" style="width:64px"> 秒
+    （拉长"未发布"窗口，用于建批中途退出演练）</span>
 </form>
 
 <h2 style="margin-top:34px">报送批次</h2>
-{% if busy %}
-<div class="flash info">当前有一个浏览器报送任务正在运行（每批同一时刻只允许一份）。</div>
+{% if lock %}
+<div class="flash info">当前有一个浏览器报送任务正在运行
+  （控制台 {{ lock.owner_name }} · 批次 #{{ lock.batch_id }}），
+  每批同一时刻只允许一份。</div>
+{% elif busy %}
+<div class="flash info">当前有一个浏览器报送任务正在运行（本控制台），
+  每批同一时刻只允许一份。</div>
 {% endif %}
 {% if not batches %}
 <p class="muted">还没有批次。</p>
 {% else %}
 <table>
-  <thead><tr><th>批次</th><th>文件</th><th>状态</th><th>行数/状态分布</th><th>更新时间</th><th></th></tr></thead>
+  <thead><tr><th>批次</th><th>文件</th><th>建批控制台</th><th>状态</th>
+    <th>行数/状态分布</th><th>更新时间</th><th></th></tr></thead>
   <tbody>
   {% for b in batches %}
   <tr>
     <td>#{{ b.id }}</td>
     <td>{{ b.filename }}</td>
-    <td><span class="pill batch-{{ b.status }}">{{ b.status }}</span>
-        {% if b.busy %}<div class="muted">运行中…</div>{% endif %}</td>
+    <td>{{ b.created_by or '—' }}</td>
+    <td><span class="pill batch-{{ b.status }}">{{ b.status }}</span></td>
     <td class="counts">
       共 {{ b.total }} 行
       {% for st, n in b.counts.items() if n %}

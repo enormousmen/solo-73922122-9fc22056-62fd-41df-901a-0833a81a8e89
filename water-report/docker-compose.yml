@@ -1,7 +1,9 @@
 # 可实际启动的演示环境：
-#   legacy   —— 只有网页表单的旧报送站（SQLite 持久化，允许重复键，带断连开关）
-#   reporter —— 报送控制台（FastAPI + SQLite + 真实 Chromium/Playwright）
-# 两个服务的数据各自落在命名卷，容器重建不丢数据。
+#   legacy     —— 只有网页表单的旧报送站（SQLite 持久化，允许重复键，带断连开关）
+#   reporter-a —— 报送控制台 A（FastAPI + SQLite + 真实 Chromium/Playwright）
+#   reporter-b —— 报送控制台 B（与 A 共享同一 SQLite 与上传目录）
+# 两个控制台挂载同一个命名卷 reporter-data：同一库文件、同一上传目录。
+# 数据落命名卷，容器重建不丢数据；down -v 才会清空。
 services:
   legacy:
     build:
@@ -21,15 +23,17 @@ services:
       timeout: 3s
       retries: 10
 
-  reporter:
+  reporter-a:
     build:
       context: .
       dockerfile: Dockerfile.reporter
-    container_name: water-reporter
+    container_name: water-reporter-a
     depends_on:
       legacy:
         condition: service_healthy
     environment:
+      CONSOLE_NAME: A
+      PEER_CONSOLE_URL: http://localhost:8002
       REPORTER_DB: /data/reporter.db
       UPLOAD_DIR: /data/uploads
       SCREENSHOT_DIR: /data/screenshots
@@ -37,12 +41,45 @@ services:
       HEADLESS: "1"
       SLOW_MO_MS: "150"      # 放慢动作便于人工观察浏览器填表
     ports:
-      - "8000:8000"          # 报送控制台：http://localhost:8000
+      - "8000:8000"          # 报送控制台 A：http://localhost:8000
     volumes:
-      - reporter-data:/data
-      # 把示例 CSV 挂进去，方便容器内手工测试
+      - reporter-data:/data  # 与 reporter-b 共享：同一 SQLite、同一上传目录
       - ./data:/samples:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  reporter-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.reporter
+    container_name: water-reporter-b
+    depends_on:
+      legacy:
+        condition: service_healthy
+    environment:
+      CONSOLE_NAME: B
+      PEER_CONSOLE_URL: http://localhost:8000
+      REPORTER_DB: /data/reporter.db
+      UPLOAD_DIR: /data/uploads
+      SCREENSHOT_DIR: /data/screenshots
+      LEGACY_URL: http://legacy:8000
+      HEADLESS: "1"
+      SLOW_MO_MS: "150"
+    ports:
+      - "8002:8000"          # 报送控制台 B：http://localhost:8002
+    volumes:
+      - reporter-data:/data  # 与 reporter-a 共享：同一 SQLite、同一上传目录
+      - ./data:/samples:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
 volumes:
   legacy-data:
